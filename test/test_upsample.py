@@ -2,12 +2,16 @@ import sys
 import os
 import torch
 
-if len(sys.argv) != 2:
-    print('Usage: 5d_upsample_ex <device: cpu|mps|cuda>')
+print(f'torch version: {torch.__version__}, torch.file: {torch.__file__}')
+if len(sys.argv) != 2 and len(sys.argv) != 3:
+    print('Usage: 5d_upsample_ex <device: cpu|mps|cuda> <compare_with_cpu: 0|1>')
     exit(1)
 
 device=sys.argv[1]
-print(f'Running on device: {device}')
+compare_with_cpu=0
+if len(sys.argv) == 3:
+    compare_with_cpu=int(sys.argv[2])
+print(f'Running on device: {device}, compare_with_cpu: {compare_with_cpu}')
 
 def runTest(x_shape, sz):
     print(f'Process pid=: {os.getpid()}')
@@ -30,12 +34,13 @@ def runTest(x_shape, sz):
     print(f'{output}: {output.shape}\n')
     print(f'x.grad={x.grad}, sh={x.grad.shape}')
 
-    # Compare result with the default CPU implementation
-    x_cpu=torch.arange(1, num_el+1, dtype=torch.float32, device="cpu").view(N, C, D, H, W)
-    x_cpu.requires_grad = True
-    output_cpu = upsampleFn(x_cpu)
-    output_cpu.backward(torch.ones_like(output_cpu))
-    print(f"x == x_cpu: {torch.equal(x.cpu(), x_cpu)}")
+    if compare_with_cpu == 1:
+        # Compare result with the default CPU implementation
+        x_cpu=torch.arange(1, num_el+1, dtype=torch.float32, device="cpu").view(N, C, D, H, W)
+        x_cpu.requires_grad = True
+        output_cpu = upsampleFn(x_cpu)
+        output_cpu.backward(torch.ones_like(output_cpu))
+        print(f"x == x_cpu: {torch.equal(x.cpu(), x_cpu)}")
 
 # runTest((1,1,1,2,3), (1,2,4)) #test-00
 # runTest((1,1,1,2,3), (1,4,4)) #test-03
@@ -50,7 +55,7 @@ def runTest(x_shape, sz):
 # runTest((1,1,1,2,3), (33, 13, 12)) #test-12
 # runTest((2,1,1,2,3), (33, 13, 12)) #test-13 batchsz > 1
 # runTest((2,2,1,2,3), (33, 13, 12)) #test-14 batchsz > 1
-runTest((2,3,1,2,3), (33, 11, 12)) #test-14 
+# runTest((2,3,1,2,3), (33, 11, 12)) #test-14 
 
 # runTest((2,3,1,2,3), (33, 11, 12)) #test-14
 # runTest((2,2,1,2,3), (1,2,4)) #test-15
@@ -64,3 +69,4 @@ runTest((2,3,1,2,3), (33, 11, 12)) #test-14
 
 # runTest((1,1,3,2,2), (1,2,3)) #test-02 : Downsampling on D (3-->2)
 # runTest((1,1,3,2,2), (1,2,2)) #test-02 : Downsampling on D (3-->2)
+runTest((1,3,50,200,300), (55, 205, 305)) #test-14 
