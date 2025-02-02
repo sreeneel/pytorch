@@ -6476,6 +6476,54 @@ class TestMPS(TestCaseMPS):
         helper(1, 1, 4, 4)
         helper(7, 5, 3, 2)
 
+    def test_upsample_nearest3d(self):
+        def helper(**kwargs):
+            N, C, D, H, W = kwargs['inputShape']
+            sz = kwargs['sz']
+            inputCPU = torch.arange(N * C * D * H * W, device='cpu', dtype=torch.float,
+                                    requires_grad=True).reshape(N, C, D, H, W)
+                                    # requires_grad=True).reshape(N, C, D, H, W).to(memory_format=memory_format)
+            inputCPU.retain_grad()
+            inputMPS = inputCPU.detach().to('mps').requires_grad_()
+
+            upsampleFn = torch.nn.Upsample(size=sz, mode='nearest')
+            outputCPU = upsampleFn(inputCPU)
+            outputMPS = upsampleFn(inputMPS)
+            self.assertEqual(outputCPU, outputMPS)
+
+            outputCPU.backward(gradient=torch.full_like(outputCPU, 1.0))
+            outputMPS.backward(gradient=torch.full_like(outputMPS, 1.0))
+            self.assertEqual(inputCPU.grad, inputMPS.grad)
+
+        inputs = [
+                { 'inputShape': (1, 1, 1, 2, 3), 'sz': (1, 2, 4) },
+                { 'inputShape': (1,1,1,2,3), 'sz': (1,4,4) },
+                { 'inputShape': (1,1,2,2,3), 'sz': (2,4,4) },
+                { 'inputShape': (1,1,1,2,3), 'sz': (2,3,4) },
+                { 'inputShape': (1,2,2,2,3), 'sz': (3,3,4) },
+                { 'inputShape': (1,1,1,2,3), 'sz': (10, 8, 8) },
+                { 'inputShape': (1,1,1,2,3), 'sz': (12, 10, 10) },
+                { 'inputShape': (1,1,2,2,3), 'sz': (12, 10, 10) },
+                { 'inputShape': (1,1,2,2,3), 'sz': (10, 10, 10) },
+                { 'inputShape': (1,1,2,2,3), 'sz': (10, 11, 12) },
+                { 'inputShape': (1,1,1,2,3), 'sz': (33, 13, 12) },
+                { 'inputShape': (2,1,1,2,3), 'sz': (33, 13, 12) },
+                { 'inputShape': (2,2,1,2,3), 'sz': (33, 13, 12) },
+                { 'inputShape': (2,3,1,2,3), 'sz': (33, 11, 12) },
+                { 'inputShape': (2,3,1,2,3), 'sz': (33, 11, 12) },
+                { 'inputShape': (2,2,1,2,3), 'sz': (1,2,4) },
+                { 'inputShape': (2,2,2,3,4), 'sz': (3,4,5) },
+                { 'inputShape': (1,1,1,2,3), 'sz': (1,3,2) },
+                { 'inputShape': (1,1,1,2,3), 'sz': (1,4,2) },
+                { 'inputShape': (1,1,1,3,2), 'sz': (1,2,3) },
+                { 'inputShape': (1,1,1,3,2), 'sz': (1,2,2) },
+                { 'inputShape': (1,1,3,2,2), 'sz': (1,2,3) },
+                { 'inputShape': (1,1,3,2,2), 'sz': (1,2,2) },
+                ]
+        # for memory_format in [torch.channels_last, torch.contiguous_format]:
+        for input in inputs:
+            helper(**input)
+
     def test_interpolate(self):
         def helper(shape, output_size, scales, mode, align_corners=False):
             inputCPU = torch.randn(shape, device='cpu', dtype=torch.float, requires_grad=True)
