@@ -37,9 +37,248 @@
 #include <ATen/ops/upsample_nearest2d_backward.h>
 #include <ATen/ops/upsample_nearest2d_backward_native.h>
 #include <ATen/ops/upsample_nearest2d_native.h>
+#include <ATen/ops/upsample_nearest3d.h>
+#include <ATen/ops/upsample_nearest3d_native.h>
+#include <ATen/ops/upsample_nearest3d_backward.h>
+#include <ATen/ops/upsample_nearest3d_backward_native.h>
 #endif
 namespace at::native {
 namespace mps {
+
+static char const* UPSAMPLE_NEAREST3D_KERNEL = R"UPSAMPLE3D_KERN(
+#include <metal_stdlib>
+#include <metal_logging>
+using namespace metal;
+
+// see NOTE [ Nearest neighbor upsampling kernel implementation ]
+int nn_compute_source_index(const float scale, int dst_index, int input_size) {
+    const int src_index = min(static_cast<int>(floor(dst_index * scale)), input_size - 1);
+    return src_index;
+}
+
+//NCDHW
+struct Upsample3DParams {
+    size_t dstNumEl;
+    size_t batchSz;
+    size_t numChannels;
+    size_t srcDepth;
+    size_t srcHeight;
+    size_t srcWidth;
+    size_t dstDepth;
+    size_t dstHeight;
+    size_t dstWidth;
+    float depthScale;
+    float heightScale;
+    float widthScale;
+};
+
+inline void _upsample_nearest3d_kernel_impl(device float const* src [[buffer(0)]],
+                                      device float* dst [[buffer(1)]],
+                                      constant Upsample3DParams& upsample3DParams,
+                                      size_t threadPosInGrid) {
+
+    size_t threadIdx = threadPosInGrid;
+    size_t dstIdx = threadPosInGrid;
+
+    size_t dst_h_stride = upsample3DParams.dstWidth;
+    size_t dst_d_stride = upsample3DParams.dstHeight * upsample3DParams.dstWidth;
+    size_t dst_c_stride = upsample3DParams.dstDepth * upsample3DParams.dstHeight * upsample3DParams.dstWidth;
+    size_t dst_n_stride = upsample3DParams.numChannels * upsample3DParams.dstDepth * upsample3DParams.dstHeight * upsample3DParams.dstWidth;
+
+    size_t src_h_stride = upsample3DParams.srcWidth;
+    size_t src_d_stride = upsample3DParams.srcHeight * upsample3DParams.srcWidth;
+    size_t src_c_stride = upsample3DParams.srcDepth * upsample3DParams.srcHeight * upsample3DParams.srcWidth;
+    size_t src_n_stride = upsample3DParams.numChannels * upsample3DParams.srcDepth * upsample3DParams.srcHeight * upsample3DParams.srcWidth;
+
+    size_t batchSz = threadIdx / dst_n_stride;
+    threadIdx = threadIdx % dst_n_stride;
+    size_t chSz = threadIdx / dst_c_stride;
+    threadIdx = threadIdx % dst_c_stride;
+    size_t dstDIndx = threadIdx / dst_d_stride;
+    threadIdx = threadIdx % dst_d_stride;
+    size_t dstHIndx = threadIdx / dst_h_stride;
+    threadIdx = threadIdx % dst_h_stride;
+    size_t dstWIndx = threadIdx;
+
+    auto srcDIndx = nn_compute_source_index(upsample3DParams.depthScale, dstDIndx, upsample3DParams.srcDepth);
+    auto srcHIndx = nn_compute_source_index(upsample3DParams.heightScale, dstHIndx, upsample3DParams.srcHeight);
+    auto srcWIndx = nn_compute_source_index(upsample3DParams.widthScale, dstWIndx, upsample3DParams.srcWidth);
+    auto srcIdx = (batchSz * src_n_stride) + (chSz * src_c_stride) + (srcDIndx * src_d_stride) + (srcHIndx * src_h_stride) + srcWIndx;
+
+    dst[dstIdx] = src[srcIdx];
+
+}
+
+kernel void upsample_nearest3d_kernel(device float const* src [[buffer(0)]],
+                                      device float* dst [[buffer(1)]],
+                                      constant Upsample3DParams& upsample3DParams [[buffer(2)]],
+                                      uint3 thread_position_in_grid [[thread_position_in_grid]],
+                                      uint3 threads_per_grid [[threads_per_grid]]) {
+    
+    auto threadId = thread_position_in_grid.x +
+                      thread_position_in_grid.y * threads_per_grid.x +
+                      thread_position_in_grid.z * threads_per_grid.y * threads_per_grid.x;
+    if(threadId > upsample3DParams.dstNumEl) {
+        return;
+    }
+
+    _upsample_nearest3d_kernel_impl(src, dst, upsample3DParams, threadId);
+}
+
+// --------- upsample3d backward kernel -----------
+// see NOTE [ Nearest neighbor upsampling kernel implementation ]
+inline static int nn_bw_compute_source_index(const float scale, int dst_index, int output_size) {
+  // Equivalent to buggy OpenCV INTER_NEAREST
+  // We keep this method for BC and consider as deprecated.
+  // See nearest_neighbor_exact_bw_compute_source_index as replacement
+  const int src_index = min(static_cast<int>(ceil(dst_index * scale)), output_size);
+  return src_index;
+}
+
+//dst <-- Grad being calculated
+//src <-- 3DUpsample-ed Tensor
+struct Upsample3DBackwardParams {
+    size_t dstNumEl;
+    size_t batchSz;
+    size_t numChans;
+
+    size_t dstDepth; //dst => Grad
+    size_t dstHeight;
+    size_t dstWidth;
+    size_t dstBatchStride;
+    size_t dstChannelStride;
+    size_t dstDepthStride;
+    size_t dstHeightStride;
+
+    size_t srcDepth; //src => 3DUpsampled-Ouput
+    size_t srcHeight;
+    size_t srcWidth;
+    size_t srcBatchStride;
+    size_t srcChannelStride;
+    size_t srcDepthStride;
+    size_t srcHeightStride;
+
+    float upToDownDepthScale;
+    float upToDownHeightScale;
+    float upToDownWidthScale;
+};
+inline void _upsample_nearest3d_backward_kernel_impl(device float* dst[[buffer(0)]],
+                                      constant Upsample3DBackwardParams& upsample3DParams [[buffer(2)]],
+                                      size_t threadPosInGrid) {
+    //dst <-- Grad being calculated
+    //src <-- 3DUpsample-ed Tensor
+
+    size_t threadIdx = threadPosInGrid;
+    size_t dstIdx = threadPosInGrid;
+
+    threadIdx = threadIdx % upsample3DParams.dstBatchStride;
+    threadIdx = threadIdx % upsample3DParams.dstChannelStride;
+    size_t dstDIndx = threadIdx / upsample3DParams.dstDepthStride;
+    threadIdx = threadIdx % upsample3DParams.dstDepthStride;
+    size_t dstHIndx = threadIdx / upsample3DParams.dstHeightStride;
+    threadIdx = threadIdx % upsample3DParams.dstHeightStride;
+    size_t dstWIndx = threadIdx;
+
+    auto srcD = nn_bw_compute_source_index(upsample3DParams.upToDownDepthScale, dstDIndx, upsample3DParams.srcDepth);
+    if(upsample3DParams.upToDownDepthScale < 1 && static_cast<size_t>(srcD) >= upsample3DParams.srcDepth) {
+        //special handling for possible downsampling on any of the dims
+        dst[dstIdx] = 0;
+        return;
+    }
+    auto srcDPlus1 = nn_bw_compute_source_index(upsample3DParams.upToDownDepthScale, dstDIndx+1, upsample3DParams.srcDepth);
+
+    auto srcH = nn_bw_compute_source_index(upsample3DParams.upToDownHeightScale, dstHIndx, upsample3DParams.srcHeight);
+    if(upsample3DParams.upToDownHeightScale < 1 && static_cast<size_t>(srcH) >= upsample3DParams.srcHeight) {
+        //special handling for possible downsampling on any of the dims
+        dst[dstIdx] = 0;
+        return;
+    }
+    auto srcHPlus1 = nn_bw_compute_source_index(upsample3DParams.upToDownHeightScale, dstHIndx+1, upsample3DParams.srcHeight);
+
+    auto srcW = nn_bw_compute_source_index(upsample3DParams.upToDownWidthScale, dstWIndx, upsample3DParams.srcWidth);
+    if(upsample3DParams.upToDownWidthScale < 1 && static_cast<size_t>(srcW) >= upsample3DParams.srcWidth) {
+        //special handling for possible downsampling on any of the dims
+        dst[dstIdx] = 0;
+        return;
+    }
+    auto srcWPlus1 = nn_bw_compute_source_index(upsample3DParams.upToDownWidthScale, dstWIndx+1, upsample3DParams.srcWidth);
+
+    dst[dstIdx] = max(srcDPlus1-srcD, 1) * max(srcHPlus1-srcH, 1) * max(srcWPlus1-srcW, 1);
+}
+
+kernel void upsample_nearest3d_backward_kernel(device float* dst[[buffer(0)]],
+                                      constant Upsample3DBackwardParams& upsample3DParams [[buffer(1)]],
+                                      uint3 thread_position_in_grid [[thread_position_in_grid]],
+                                      uint3 threads_per_threadgroup [[ threads_per_threadgroup ]]) {
+
+    auto threadId = thread_position_in_grid.x +
+                        thread_position_in_grid.y * threads_per_threadgroup.y +
+                        thread_position_in_grid.z * threads_per_threadgroup.y * threads_per_threadgroup.x;
+
+    if(threadId > upsample3DParams.dstNumEl) {
+        return;
+    }
+
+    _upsample_nearest3d_backward_kernel_impl(dst, upsample3DParams, threadId);
+}
+)UPSAMPLE3D_KERN";
+
+static id<MTLLibrary> compileUpsample3dKernelLibrary(id<MTLDevice> device) {
+	static id<MTLLibrary> upsampleMtlLibrary = nil;
+	if (upsampleMtlLibrary) {
+		return upsampleMtlLibrary;
+	}
+
+	NSError* error = nil;
+	MTLCompileOptions* options = [[MTLCompileOptions new] autorelease];
+  [options setLanguageVersion:MTLLanguageVersion3_2];
+  options.enableLogging = true;
+	upsampleMtlLibrary = [device newLibraryWithSource:[NSString stringWithCString:UPSAMPLE_NEAREST3D_KERNEL
+		encoding:NSASCIIStringEncoding]
+		options:options
+		error:&error];
+	TORCH_CHECK(
+			upsampleMtlLibrary, "Failed to create metal UPSAMPLE_3D_NN_KERNEL, error: ", [[error description] UTF8String]);
+	return upsampleMtlLibrary;
+}
+
+static id<MTLComputePipelineState> upsample3DNearestNeighborPSO(id<MTLDevice> device) {
+	std::string kernel = "upsample_nearest3d_kernel";
+	static std::unordered_map<std::string, id<MTLComputePipelineState>> psoCache;
+	id<MTLComputePipelineState> pso = psoCache[kernel];
+	if (pso) {
+		return pso;
+	}
+
+	NSError* error = nil;
+	id<MTLLibrary> upsample3dLib = compileUpsample3dKernelLibrary(device);
+	id<MTLFunction> upsample3dNNFunc = [upsample3dLib newFunctionWithName:[NSString stringWithUTF8String:kernel.c_str()]];
+	TORCH_CHECK(upsample3dNNFunc, "Failed to create function state object for: ", kernel);
+	pso = [device newComputePipelineStateWithFunction:upsample3dNNFunc error:&error];
+	TORCH_CHECK(pso, "Failed to created pipeline state object, error: ", [[error description] UTF8String]);
+
+	psoCache[kernel] = pso;
+	return pso;
+}
+
+static id<MTLComputePipelineState> upsample3DNearestNeighborBackwardPSO(id<MTLDevice> device) {
+	std::string kernel = "upsample_nearest3d_backward_kernel";
+	static std::unordered_map<std::string, id<MTLComputePipelineState>> psoCache;
+	id<MTLComputePipelineState> pso = psoCache[kernel];
+	if (pso) {
+		return pso;
+	}
+
+	NSError* error = nil;
+	id<MTLLibrary> upsample3dLib = compileUpsample3dKernelLibrary(device);
+	id<MTLFunction> upsample3dNNFunc = [upsample3dLib newFunctionWithName:[NSString stringWithUTF8String:kernel.c_str()]];
+	TORCH_CHECK(upsample3dNNFunc, "Failed to create function state object for: ", kernel);
+	pso = [device newComputePipelineStateWithFunction:upsample3dNNFunc error:&error];
+	TORCH_CHECK(pso, "Failed to created pipeline state object, error: ", [[error description] UTF8String]);
+
+	psoCache[kernel] = pso;
+	return pso;
+}
 
 // Upsampling operations (1D/2D forward and backward)
 // supported resize_mode: 'nearest' | 'bilinear' | 'nearest-exact'
@@ -465,6 +704,234 @@ TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_out_mps)
   TORCH_CHECK(at::isFloatingType(input.scalar_type()),
               "_upsample_bilineard2d_aa_out_mps only supports floating-point dtypes");
   mps::upsample_kernel_out_template(input, output_size, align_corners, scales_h, scales_w, output, "bilinear2d_aa");
+}
+
+static void upsample_nearest3d_out_mps_impl(Tensor const& input,
+                                            IntArrayRef output_size,
+                                            c10::optional<double> scales_d,
+                                            c10::optional<double> scales_h,
+                                            c10::optional<double> scales_w,
+                                            const Tensor& output) {
+  if (input.numel() == 0) {
+    return;
+  }
+
+  struct Upsample3DParams {
+    int64_t outNumEl;
+    int64_t batchSz;
+    int64_t numChannels;
+    int64_t inpDepth;
+    int64_t inpHeight;
+    int64_t inpWidth;
+    int64_t outDepth;
+    int64_t outHeight;
+    int64_t outWidth;
+    float depthScale;
+    float heightScale;
+    float widthScale;
+  };
+
+  const auto inpDepth = input.size(2);
+  const auto inpHeight = input.size(3);
+  const auto inpWidth = input.size(4);
+
+  const auto outDepth = output.size(2);
+  const auto outHeight = output.size(3);
+  const auto outWidth = output.size(4);
+
+  const float scaleDepth = compute_scales_value<float>(scales_d, inpDepth, outDepth);
+  const float scaleHeight = compute_scales_value<float>(scales_h, inpHeight, outHeight);
+  const float scaleWidth = compute_scales_value<float>(scales_w, inpWidth, outWidth);
+
+  const Upsample3DParams ups3dParams = {.outNumEl = output.numel(),
+                                        .batchSz = output.size(0),
+                                        .numChannels = output.size(1),
+                                        .inpDepth = inpDepth,
+                                        .inpHeight = inpHeight,
+                                        .inpWidth = inpWidth,
+                                        .outHeight = outHeight,
+                                        .outWidth = outWidth,
+                                        .outDepth = outDepth,
+                                        .depthScale = scaleDepth,
+                                        .heightScale = scaleHeight,
+                                        .widthScale = scaleWidth};
+
+  id<MTLDevice> device = MPSDevice::getInstance()->device();
+  MPSStream* mpsStream = getCurrentMPSStream();
+
+  dispatch_sync(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      TORCH_CHECK(computeEncoder, "Failed to create compute command encoder");
+
+      NSError* error = nil;
+
+      id<MTLComputePipelineState> kernelPSO = mps::upsample3DNearestNeighborPSO(device);
+      TORCH_CHECK(kernelPSO, error.localizedDescription.UTF8String);
+
+      // TODO
+      // getMPSProfiler().beginProfileKernel(kernelPSO, kernel, {input, other});
+      //  Encode the pipeline state object and its parameters.
+      [computeEncoder setComputePipelineState:kernelPSO];
+      [computeEncoder setBuffer:mps::getMTLBufferStorage(input) offset:0 atIndex:0];
+      [computeEncoder setBuffer:mps::getMTLBufferStorage(output) offset:0 atIndex:1];
+      [computeEncoder setBytes:&ups3dParams length:sizeof(ups3dParams) atIndex:2];
+
+      // Grid Dispatch configuration
+      // Configure 3D ThreadGroup
+      NSUInteger w = kernelPSO.threadExecutionWidth;
+      NSUInteger h = kernelPSO.maxTotalThreadsPerThreadgroup / w;
+      NSUInteger d = 1;
+      MTLSize bdim = MTLSizeMake(w, h, d);
+      //NSLog(@"threadExecutionWidth=%lu, maxTotalThreadsPerThreadgroup=%lu, threadsPerThreadGroup(w=%lu, h=%lu, d=%lu)",
+            //kernelPSO.threadExecutionWidth,
+            //kernelPSO.maxTotalThreadsPerThreadgroup,
+            //bdim.width, bdim.height, bdim.depth);
+
+      // Configure threads Grid
+      auto outNumEl = output.numel();
+      auto gW = (outWidth + w - 1) / w;
+      auto gH = (outHeight + h - 1) / h;
+      auto gD = (outNumEl + (gH * gW) - 1) / (gH * gW);
+      MTLSize tgpg = MTLSizeMake(gW, gH, gD);
+      //NSLog(@"GridSz(w=%lu, h=%lu, d=%lu)", tgpg.width, tgpg.height, tgpg.depth);
+      [computeEncoder dispatchThreadgroups:tgpg threadsPerThreadgroup:bdim];
+
+      // getMPSProfiler().endProfileKernel(kernelPSO); //TODO
+    }
+  });
+}
+
+static void upsample_nearest3d_backward_out_mps_impl(Tensor const& input,
+                                                     c10::optional<double> scales_d,
+                                                     c10::optional<double> scales_h,
+                                                     c10::optional<double> scales_w,
+                                                     const Tensor& output) {
+  if (input.numel() == 0) {
+    return;
+  }
+
+  // out <-- Grad being calculated (output)
+  // inp <-- 3DUpsample-ed Tensor (inpput)
+  struct Upsample3DBackwardsParams {
+    int64_t outNumEl;
+    int64_t batchSz;
+    int64_t numChans;
+
+    int64_t outDepth; // out => Grad
+    int64_t outHeight;
+    int64_t outWidth;
+    int64_t outBatchStride;
+    int64_t outChannelStride;
+    int64_t outDepthStride;
+    int64_t outHeightStride;
+
+    int64_t inpDepth; // inp => 3DUpsampled-Ouput
+    int64_t inpHeight;
+    int64_t inpWidth;
+    int64_t inpBatchStride;
+    int64_t inpChannelStride;
+    int64_t inpDepthStride;
+    int64_t inpHeightStride;
+
+    float inpToOutDepthScale;
+    float inpToOutHeightScale;
+    float inpToOutWidthScale;
+  };
+
+  Upsample3DBackwardsParams backwardsParams = {
+      .outNumEl = output.numel(), // Grad will have same numel as src
+
+      .batchSz = output.size(0),
+      .numChans = output.size(1),
+
+      .outDepth = output.size(2), // out => Grad
+      .outHeight = output.size(3),
+      .outWidth = output.size(4),
+      .outBatchStride = (output.size(1) * output.size(2) * output.size(3) * output.size(4)),
+      .outChannelStride = (output.size(2) * output.size(3) * output.size(4)),
+      .outDepthStride = (output.size(3) * output.size(4)),
+      .outHeightStride = output.size(4),
+
+      .inpDepth = input.size(2),
+      .inpHeight = input.size(3),
+      .inpWidth = input.size(4),
+      .inpBatchStride = (input.size(1) * input.size(2) * input.size(3) * input.size(4)),
+      .inpChannelStride = (input.size(2) * input.size(3) * input.size(4)),
+      .inpDepthStride = (input.size(3) * input.size(4)),
+      .inpHeightStride = input.size(4),
+
+      .inpToOutDepthScale = compute_scales_value<float>(scales_d, input.size(2), output.size(2)),
+      .inpToOutHeightScale = compute_scales_value<float>(scales_h, input.size(3), output.size(3)),
+      .inpToOutWidthScale = compute_scales_value<float>(scales_w, input.size(4), output.size(4)),
+  };
+
+  id<MTLDevice> device = MPSDevice::getInstance()->device();
+  MPSStream* mpsStream = getCurrentMPSStream();
+
+  dispatch_sync(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      TORCH_CHECK(computeEncoder, "Failed to create compute command encoder");
+
+      NSError* error = nil;
+
+      id<MTLComputePipelineState> kernelPSO = mps::upsample3DNearestNeighborBackwardPSO(device);
+      TORCH_CHECK(kernelPSO, error.localizedDescription.UTF8String);
+
+      // TODO
+      // getMPSProfiler().beginProfileKernel(kernelPSO, kernel, {input, other});
+      //  Encode the pipeline state object and its parameters.
+      [computeEncoder setComputePipelineState:kernelPSO];
+      [computeEncoder setBuffer:mps::getMTLBufferStorage(output) offset:0 atIndex:0];
+      [computeEncoder setBytes:&backwardsParams length:sizeof(backwardsParams) atIndex:1];
+
+      // Grid Dispatch configuration
+      // Configure 3D ThreadGroup
+      NSUInteger w = kernelPSO.threadExecutionWidth;
+      NSUInteger h = kernelPSO.maxTotalThreadsPerThreadgroup / w;
+      NSUInteger d = 1;
+      MTLSize bdim = MTLSizeMake(w, h, d);
+      //NSLog(@"threadExecutionWidth=%lu, maxTotalThreadsPerThreadgroup=%lu, threadsPerThreadGroup(w=%lu, h=%lu, d=%lu)",
+            //kernelPSO.threadExecutionWidth,
+            //kernelPSO.maxTotalThreadsPerThreadgroup,
+            //bdim.width,
+            //bdim.height,
+            //bdim.depth);
+
+      // Configure threads Grid
+      auto dstNumEl = output.numel();
+      auto gW = (output.size(4) + w - 1) / w;
+      auto gH = (output.size(3) + h - 1) / h;
+      auto gD = (output.size(2) + (gH * gW) - 1) / (gH * gW);
+      MTLSize tgpg = MTLSizeMake(gW, gH, gD);
+      //NSLog(@"GridSz(w=%lu, h=%lu, d=%lu)", tgpg.width, tgpg.height, tgpg.depth);
+      [computeEncoder dispatchThreadgroups:tgpg threadsPerThreadgroup:bdim];
+
+      // getMPSProfiler().endProfileKernel(kernelPSO); //TODO
+    }
+  });
+}
+
+TORCH_IMPL_FUNC(upsample_nearest3d_out_mps)
+(const Tensor& input,
+ IntArrayRef output_size,
+ c10::optional<double> scales_d,
+ c10::optional<double> scales_h,
+ c10::optional<double> scales_w,
+ const Tensor& output) {
+    upsample_nearest3d_out_mps_impl(input, output_size, scales_d, scales_h, scales_w, output);
+}
+
+TORCH_IMPL_FUNC(upsample_nearest3d_backward_out_mps)
+(const Tensor& grad_output,
+ IntArrayRef output_size,
+ IntArrayRef input_size,
+ c10::optional<double> scales_d,
+ c10::optional<double> scales_h,
+ c10::optional<double> scales_w,
+ const Tensor& grad_input) {
+    upsample_nearest3d_backward_out_mps_impl(grad_output, scales_d, scales_h, scales_w, grad_input);
 }
 
 } // namespace at::native
